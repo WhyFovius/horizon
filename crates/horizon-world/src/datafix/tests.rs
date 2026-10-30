@@ -78,3 +78,90 @@ fn block_states_take_their_new_field_names() {
     assert!(state.get("properties").is_some());
     assert_eq!(chunk.get("DataVersion"), Some(&Tag::Int(CURRENT)));
 }
+
+/// A conversion that stops on a bad chunk leaves the old DataVersion in
+/// level.dat, so the next open retries instead of accepting a mix of a
+/// current level.dat and old-format chunks (#3882); a successful one stamps
+/// it only once every file is converted.
+#[test]
+fn a_failed_conversion_leaves_the_old_data_version() {
+    use crate::compression::Compression;
+    use crate::nbt::{Limits, NamedTag};
+    use crate::region::{ChunkRecord, RegionFile, RegionWriter};
+    use horizon_core::position::ChunkPos;
+    use std::io::{Read, Seek, SeekFrom, Write};
+    const VERSION: i32 = 4903;
+    let version_of = |world: &std::path::Path| {
+        files::read_dat(&world.join("level.dat"))
+            .unwrap()
+            .and_then(|root| root.get("Data").cloned())
+            .and_then(|data| data.get("DataVersion").cloned())
+            .map(|tag| match tag {
+                Tag::Int(v) => v,
+                _ => panic!("DataVersion is not an int"),
+            })
+    };
+    let root = std::env::temp_dir().join(format!("horizon-upgrade-stamp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    for good in [true, false] {
+        let world = root.join(if good { "good" } else { "bad" });
+        std::fs::create_dir_all(&world).unwrap();
+        files::write_dat(
+            &world.join("level.dat"),
+            &Tag::compound([("Data", snbt(&format!("{{DataVersion: {VERSION}}}")))]),
+        )
+        .unwrap();
+        let folder = world.join("dimensions/minecraft/overworld/region");
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("r.0.0.mca");
+        let record = ChunkRecord::from_nbt(
+            &NamedTag {
+                name: "".into(),
+                tag: snbt("{DataVersion: 4903, Status: \"minecraft:full\"}"),
+            },
+            Compression::Zlib,
+            1,
+            Limits::default(),
+        )
+        .unwrap();
+        let mut writer = RegionWriter::create(&path).unwrap();
+        writer.write(ChunkPos::new(0, 0), &record).unwrap();
+        writer.finish().unwrap();
+        if !good {
+            // A length the pointed sectors cannot hold: reading the chunk fails.
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            let mut entry = [0; 4];
+            file.seek(SeekFrom::Start(0)).unwrap();
+            file.read_exact(&mut entry).unwrap();
+            let start = u64::from(u32::from_be_bytes(entry) >> 8) * 4096;
+            file.seek(SeekFrom::Start(start)).unwrap();
+            file.write_all(&100_000u32.to_be_bytes()).unwrap();
+            file.write_all(&[2]).unwrap();
+        }
+        let result = files::upgrade_world(&world);
+        if good {
+            assert_eq!(result.unwrap(), VERSION);
+            assert_eq!(version_of(&world), Some(CURRENT));
+            let mut region = RegionFile::open(&path).unwrap();
+            let chunk = region
+                .read(ChunkPos::new(0, 0))
+                .unwrap()
+                .expect("the chunk survives")
+                .nbt(Limits::default())
+                .unwrap();
+            assert_eq!(chunk.tag.get("DataVersion"), Some(&Tag::Int(CURRENT)));
+        } else {
+            assert!(result.is_err(), "the bad chunk fails the upgrade");
+            assert_eq!(
+                version_of(&world),
+                Some(VERSION),
+                "level.dat keeps the old version for the retry"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}

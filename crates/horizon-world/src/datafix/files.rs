@@ -1,8 +1,8 @@
 //! Opening an older world as 26.3 does: the file fixes of `FileFixerUpper`
 //! (`net.minecraft.util.filefix`, from DataVersion 4772 on) that move the
-//! files into the 26.x layout, then level.dat brought to the current version,
-//! and the upgrades vanilla runs as it reads each file ([`upgrade_world`]
-//! does them all at once, as a converter).
+//! files into the 26.x layout, the upgrades vanilla runs as it reads each
+//! file ([`upgrade_world`] does them all at once, as a converter), then
+//! level.dat stamped with the current version once everything is converted.
 use super::dynamic::{as_bool, as_int, as_str, int_list, remove, set, string};
 use super::json::{self, Json};
 use super::schema::Ty;
@@ -585,10 +585,28 @@ fn add_versions(data: &mut Tag) {
     );
 }
 
+/// The level.dat rewrite `FileFixerUpper.fix` ends with, held back: applied
+/// before the world's chunks are converted, a failed `upgrade_world_data`
+/// would leave a current DataVersion over old-format chunks, which the next
+/// open accepts as-is and never retries (#3882). Vanilla's upgrader stamps
+/// the level only after every file is converted.
+struct LevelStamp(Tag);
+
+impl LevelStamp {
+    /// `FileFixerUpper.addVersionsToLevelData`, then the write.
+    fn apply(self, base: &Path) -> io::Result<()> {
+        let mut data = self.0;
+        add_versions(&mut data);
+        write_dat(&base.join("level.dat"), &Tag::compound([("Data", data)]))
+    }
+}
+
 /// `FileFixerUpper.fix`: the file fixes a world saved at an older version
-/// needs, then its level.dat at the current version. Returns the DataVersion
-/// the world had.
-pub fn fix_world_files(base: &Path) -> io::Result<i32> {
+/// needs, and the level.dat rewrite that ends them, held back for
+/// `upgrade_world_data` to convert every file first. Returns the DataVersion
+/// the world had and the stamp to apply afterwards, or `None` when the world
+/// was already saved at the current version.
+fn fix_world_files(base: &Path) -> io::Result<(i32, Option<LevelStamp>)> {
     let root = read_dat(&base.join("level.dat"))?.ok_or_else(|| invalid("missing level.dat"))?;
     let mut data = root
         .get("Data")
@@ -596,7 +614,7 @@ pub fn fix_world_files(base: &Path) -> io::Result<i32> {
         .unwrap_or_else(|| Tag::Compound(Compound::new()));
     let loaded = data_version(&data, -1);
     if loaded >= CURRENT {
-        return Ok(loaded);
+        return Ok((loaded, None));
     }
     let mut from = loaded;
     if requires_file_fixing(loaded) {
@@ -627,9 +645,7 @@ pub fn fix_world_files(base: &Path) -> io::Result<i32> {
         let _ = fs::remove_file(base.join("session.lock"));
     }
     update(Ty::Level, &mut data, from, CURRENT);
-    add_versions(&mut data);
-    write_dat(&base.join("level.dat"), &Tag::compound([("Data", data)]))?;
-    Ok(loaded)
+    Ok((loaded, Some(LevelStamp(data))))
 }
 
 // ------------------------------------------------------------------ the read-time upgrades
@@ -786,7 +802,7 @@ fn upgrade_json_to(path: &Path, ty: Ty, to: i32) -> io::Result<()> {
 
 /// Everything vanilla upgrades as it reads a world, done at once: every chunk,
 /// entity chunk and POI chunk, saved data, player, advancements and
-/// statistics file. Run after [`fix_world_files`].
+/// statistics file. Run after the file fixes, before the level.dat stamp.
 pub fn upgrade_world_data(base: &Path) -> io::Result<()> {
     let generators = generators(base)?;
     for ns in subdirectories(&base.join("dimensions")) {
@@ -904,8 +920,15 @@ pub fn upgrade_band(base: &Path, target: i32) -> io::Result<()> {
 }
 
 /// Bring a whole world saved by 1.20 to 26.2 to the 26.3 format in place.
+/// level.dat is stamped with the current DataVersion only after every file is
+/// converted: a failed conversion leaves the old version, so the next open
+/// retries instead of accepting a mix of a current level.dat and old-format
+/// chunks (#3882).
 pub fn upgrade_world(base: &Path) -> io::Result<i32> {
-    let version = fix_world_files(base)?;
+    let (version, stamp) = fix_world_files(base)?;
     upgrade_world_data(base)?;
+    if let Some(stamp) = stamp {
+        stamp.apply(base)?;
+    }
     Ok(version)
 }

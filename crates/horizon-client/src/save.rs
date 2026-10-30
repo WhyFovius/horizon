@@ -157,11 +157,14 @@ impl SessionLock {
     }
 }
 /// Bring a world last saved by an older game version to the current format, as
-/// 26.3 does when it opens one: the file fixes and level.dat first
-/// (`FileFixerUpper`), then the DataFixers upgrades of every chunk, entity chunk,
-/// POI chunk, player, saved data, advancements and statistics file. Vanilla runs
-/// the latter as it reads each file; Horizon runs them all on opening, which reads
-/// the same data. Worlds older than the ported fixes (1.17) are refused.
+/// 26.3 does when it opens one: the file fixes first (`FileFixerUpper`), then
+/// the DataFixers upgrades of every chunk, entity chunk, POI chunk, player,
+/// saved data, advancements and statistics file, and level.dat stamped with
+/// the current version only once all of them are converted, so a failure
+/// leaves the old version for the next open to retry (#3882). Vanilla runs
+/// the upgrades as it reads each file; Horizon runs them all on opening,
+/// which reads the same data. Worlds older than the ported fixes (1.17) are
+/// refused.
 pub fn upgrade_older_world(world: &Path) -> Result<()> {
     let Some(root) = read_dat(&world.join("level.dat")) else {
         return Ok(());
