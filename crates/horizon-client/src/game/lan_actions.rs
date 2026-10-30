@@ -64,6 +64,12 @@ pub(super) struct GuestPlay {
     swing: horizon_client::first_person::SwingState,
     /// The block being dug and the face the client aimed at.
     digging: Option<([i32; 3], [i32; 3])>,
+    /// `ServerPlayerGameMode.isDestroyingBlock`: the dig is running. An ABORT
+    /// clears it but keeps the block and its `dig_start`
+    /// (`abortDestroyBlock` leaves `destroyPos` and `destroyProgressStart`),
+    /// so the STOP of a jump-mined block still counts its dig from the START
+    /// the client sent before the misses (MC-69865).
+    is_destroying: bool,
     /// The server tick the digging started (ServerPlayerGameMode.destroyProgressStart).
     dig_start: u64,
     /// A block the client stopped digging before the server's time was up: it breaks once
@@ -408,7 +414,10 @@ impl Game<'_> {
         let swing = std::mem::replace(&mut self.swing, play.swing);
         std::mem::swap(&mut self.mount, &mut play.mount);
         let (left, right) = (self.left, self.right);
-        self.left = play.digging.is_some();
+        // The guest holds the attack button as far as the server knows: while
+        // its dig runs. An ABORT left the block standing (MC-69865), and that
+        // kept one must not tick_mining a pick of the guest's own.
+        self.left = play.digging.is_some() && play.is_destroying;
         self.right = play.using.is_some() || self.using.is_some();
         // The guest's vehicle (Entity.vehicle) for its turn.
         let riding = std::mem::replace(&mut self.riding, g.vehicle);
@@ -1121,6 +1130,7 @@ impl Game<'_> {
                     let face = direction(i32::from(a.direction));
                     let play = host.play.entry(conn).or_default();
                     play.digging = Some((a.pos, face));
+                    play.is_destroying = true;
                     play.dig_start = host.hub.ticks;
                     play.last_progress = -1;
                     // The pause between two blocks is the client's (MultiPlayerGameMode's
@@ -1152,6 +1162,7 @@ impl Game<'_> {
                         && let Some(play) = host.play.get_mut(&conn)
                     {
                         play.digging = None;
+                        play.is_destroying = false;
                     }
                 }
                 1 => {}
@@ -1163,6 +1174,7 @@ impl Game<'_> {
                         // prediction.
                         let play = host.play.entry(conn).or_default();
                         play.digging = None;
+                        play.is_destroying = false;
                         play.mining = None;
                         return;
                     }
@@ -1171,7 +1183,12 @@ impl Game<'_> {
                 2 => {
                     host.hub.ack(conn, a.sequence);
                     let play = host.play.entry(conn).or_default();
-                    play.digging = None;
+                    // abortDestroyBlock: the dig ends, but the block and its
+                    // dig start stay (destroyPos and destroyProgressStart are
+                    // kept), so the STOP of a jump-mined block still counts
+                    // from the START before the misses (MC-69865) — the dig
+                    // itself is no longer simulated.
+                    play.is_destroying = false;
                     play.mining = None;
                     let state = self.world.block(a.pos[0], a.pos[1], a.pos[2]).0 as i32;
                     host.hub.send_to(
@@ -2320,7 +2337,10 @@ impl Game<'_> {
             let play = host.play.entry(conn).or_default();
             // ServerGamePacketListenerImpl.tick's dropSpamThrottler.
             play.creative_drops = play.creative_drops.saturating_sub(1);
-            let digging = play.digging;
+            // ServerPlayerGameMode.tick digs while isDestroyingBlock: an ABORT
+            // left the block (and its start) standing without a dig running
+            // (MC-69865), so only a running one is simulated.
+            let digging = play.digging.filter(|_| play.is_destroying);
             let using = play.using.is_some();
             let delayed = play.destroy_delay > 0 || play.use_delay > 0 || play.attack_ticks < 100;
             if digging.is_some() || using || delayed {
@@ -2354,6 +2374,7 @@ impl Game<'_> {
                     && (host.hub.guests[gi].creative() || play.mining.is_none())
                 {
                     play.digging = None;
+                    play.is_destroying = false;
                 }
             }
             // Player.tick's ItemCooldowns.tick, once a tick for each player
@@ -3019,6 +3040,7 @@ impl Game<'_> {
         let ticks = host.hub.ticks;
         let play = host.play.entry(conn).or_default();
         let dug = play.digging.take().is_some_and(|(p, _)| p == pos);
+        play.is_destroying = false;
         play.mining = None;
         let start = play.dig_start;
         let state = self.world.block(pos[0], pos[1], pos[2]);
@@ -3133,6 +3155,7 @@ impl Game<'_> {
             return;
         };
         let cracked = play.digging.take().filter(|_| play.last_progress >= 0);
+        play.is_destroying = false;
         play.mining = None;
         play.delayed = None;
         play.destroy_delay = 0;

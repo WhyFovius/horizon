@@ -20,6 +20,11 @@ class RemoteMiningTests(unittest.TestCase):
         source = (ROOT / "crates/horizon-client/src/game/remote.rs").read_text()
         start = source.index("    pub(super) fn stop_remote_mining(")
         end = source.index("    /// MultiPlayerGameMode.destroyBlock", start)
+        # The stop and route rules the methods call (stopDestroyBlock's gate,
+        # startDestroyBlock/continueDestroyBlock's routing), straight from the
+        # source so the fixture keeps testing the real ones.
+        helpers_start = source.index("fn stop_destroy(")
+        helpers_end = source.index("/// A protocol number format", helpers_start)
         fixture = r'''
 #![allow(dead_code)]
 #[derive(Clone, Copy)]
@@ -28,7 +33,7 @@ struct Hit { pos: [i32; 3], face: u8 }
 struct Stack { item: &'static str }
 struct Mining { pos: [i32; 3], progress: f32, ticks: u32 }
 #[derive(Default)]
-struct Remote { destroy_delay: u32, destroying: Option<([i32; 3], u8, f32)>, destroying_item: String }
+struct Remote { destroy_delay: u32, destroying: Option<([i32; 3], u8, f32)>, destroying_item: String, is_destroying: bool }
 struct Ground { on_ground: bool }
 struct Player { ground: Ground }
 #[derive(Clone)]
@@ -111,6 +116,7 @@ impl Game {
     fn tutorial_destroy<T>(&mut self, _: T, _: f32) {}
 METHOD
 }
+HELPERS
 fn main() {
     // Zero-hardness blocks and a tool fast enough to break in one tick.
     for (hardness, speed) in [(0.0, 1.0), (0.5, 15.0), (0.5, 30.0)] {
@@ -196,8 +202,44 @@ fn main() {
         assert!(game.mining.is_none());
         assert!(game.remote.as_ref().unwrap().destroying.is_none());
     }
+    // MC-69865: a jump at a too-high block aborts the dig once, then the
+    // falls are no-ops that keep the break state standing, and the held
+    // attack continues it without a second START until the STOP.
+    let mut game = Game::new(3.0, 15.0, false); // one tick digs 1/6
+    game.remote_mining(true);   // START at the first apex
+    game.remote_mining(false);  // 1/6 dug
+    game.stop_remote_mining();  // the fall misses: ABORT, the dig stops
+    {
+        let remote = game.remote.as_ref().unwrap();
+        assert!(!remote.is_destroying);
+        assert_eq!(remote.destroying, Some(([0, 64, 0], 1, 0.0)), "the target stays");
+    }
+    assert_eq!(game.packets.iter().map(|p| p.action).collect::<Vec<_>>(), [0, 2]);
+    game.stop_remote_mining();  // every later fall is a no-op
+    game.stop_remote_mining();
+    assert_eq!(game.packets.len(), 2);
+    assert_eq!(game.remote.as_ref().unwrap().destroying, Some(([0, 64, 0], 1, 0.0)));
+    // The next apex digs on where the dig stopped, without a new START: the
+    // server keeps counting the dig from the START before the misses.
+    game.remote_mining(false);
+    assert_eq!(game.packets.len(), 2, "a held attack sends no second START");
+    assert_eq!(game.mining.as_ref().unwrap().progress, 1.0 / 6.0);
+    for _ in 0..5 {
+        game.remote_mining(false);
+    }
+    assert_eq!(game.world.broken.len(), 1, "the apexes add up to the break");
+    assert_eq!(game.packets.iter().map(|p| p.action).collect::<Vec<_>>(), [0, 2, 3]);
+    // A click on the stopped dig restarts it (a fresh START, with no abort:
+    // its stop already aborted it).
+    let mut game = Game::new(3.0, 15.0, false);
+    game.remote_mining(true);
+    game.stop_remote_mining();
+    game.remote_mining(true);   // the click after the fall
+    assert_eq!(game.packets.iter().map(|p| p.action).collect::<Vec<_>>(), [0, 2, 0]);
+    assert!(game.remote.as_ref().unwrap().is_destroying);
+    assert_eq!(game.remote.as_ref().unwrap().destroying, Some(([0, 64, 0], 1, 0.0)));
 }
-'''.replace("METHOD", source[start:end].replace("pub(super) fn", "fn"))
+'''.replace("METHOD", source[start:end].replace("pub(super) fn", "fn")).replace("HELPERS", source[helpers_start:helpers_end])
         with tempfile.TemporaryDirectory(prefix="remote-mining-") as directory:
             path = Path(directory)
             (path / "main.rs").write_text(fixture)

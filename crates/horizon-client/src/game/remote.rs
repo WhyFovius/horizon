@@ -213,6 +213,11 @@ pub(super) struct Remote {
     destroying: Option<([i32; 3], u8, f32)>,
     /// `MultiPlayerGameMode.destroyingItem`: the held item key the break began with.
     destroying_item: String,
+    /// `MultiPlayerGameMode.isDestroying`: a dig runs on `destroying`. The
+    /// target survives its stop, so a jump that misses the block overhead
+    /// does not restart the dig (MC-69865): a held attack picks the state
+    /// back up once the block is in reach again.
+    is_destroying: bool,
     destroy_delay: u32,
     input: horizon_client::interaction_input::InteractionInput,
     /// Keys whose presses send a packet (swap hands, drop, a mount's
@@ -275,6 +280,54 @@ fn face_direction(face: [i32; 3]) -> u8 {
         [-1, 0, 0] => 4,
         [1, 0, 0] => 5,
         _ => 1,
+    }
+}
+
+/// `MultiPlayerGameMode.stopDestroyBlock` on the remote path's break state
+/// (`Remote::destroying` with `Remote::is_destroying`): the stop acts only
+/// while a dig runs, and even then the target stays — only the progress
+/// resets. A stop with no dig running (the falls between the jumps of
+/// MC-69865) is a no-op that leaves the whole state standing, so a held
+/// attack picks the progress back up once the block is in reach again.
+/// Returns the position to abort when the stop acted.
+fn stop_destroy(
+    destroying: &mut Option<([i32; 3], u8, f32)>,
+    is_destroying: &mut bool,
+) -> Option<[i32; 3]> {
+    if !*is_destroying {
+        return None;
+    }
+    *is_destroying = false;
+    destroying.as_mut().map(|(pos, _, progress)| {
+        *progress = 0.0;
+        *pos
+    })
+}
+
+/// What one attack tick does with the remote path's break state.
+#[derive(PartialEq, Debug)]
+enum DestroyRoute {
+    /// `continueDestroyBlock`'s same-target branch: keep accumulating, and
+    /// never send a second START — the server's `destroyProgressStart` keeps
+    /// counting from the first one (the second half of MC-69865).
+    Continue,
+    /// `startDestroyBlock`'s early return: the dig is running and the START
+    /// was already sent.
+    Running,
+    /// `startDestroyBlock`: a fresh START, with its "abort old break" —
+    /// only a running dig is aborted, a stopped one already was.
+    Start { abort_old: bool },
+}
+
+/// `MultiPlayerGameMode.startDestroyBlock` / `continueDestroyBlock` routing:
+/// a held attack (`!start`) continues the target it has, a click restarts a
+/// stopped dig (a jump's misses left it standing, MC-69865), and a new
+/// target is started either way.
+fn destroy_route(start: bool, same_target: bool, is_destroying: bool) -> DestroyRoute {
+    match (start, same_target, is_destroying) {
+        (true, true, true) => DestroyRoute::Running,
+        (false, true, _) => DestroyRoute::Continue,
+        (_, _, active) => DestroyRoute::Start { abort_old: active },
     }
 }
 
@@ -533,6 +586,7 @@ impl Game<'_> {
             profile_name: String::new(),
             destroying: None,
             destroying_item: String::new(),
+            is_destroying: false,
             destroy_delay: 0,
             input: Default::default(),
             pending_keys: Vec::new(),
@@ -4000,6 +4054,7 @@ impl Game<'_> {
             // handleMovePlayer does not change LocalPlayer.sendPosition's
             // baseline: the next tick must still report the corrected state.
             r.destroying = None;
+            r.is_destroying = false;
         }
         self.mining = None;
         self.send(S::AcceptTeleportation(play::AcceptTeleportation {
@@ -4943,17 +4998,28 @@ impl Game<'_> {
     /// `MultiPlayerGameMode.stopDestroyBlock`: aborts the break and starts
     /// the attack strength again.
     pub(super) fn stop_remote_mining(&mut self) {
-        if let Some((pos, _, _)) = self.remote.as_mut().and_then(|r| r.destroying.take()) {
-            let state = self.world.block(pos[0], pos[1], pos[2]);
-            self.tutorial_destroy(state, -1.0);
-            self.send(S::PlayerAction(play::PlayerAction {
-                action: 2,
-                pos,
-                direction: 0,
-                sequence: 0,
-            }));
-            self.reset_attack_strength();
-        }
+        // stopDestroyBlock: the stop acts only while a dig runs; the target,
+        // its progress and the crack they draw stay otherwise, so the falls
+        // between the jumps of a too-high block keep the break state
+        // standing for the held attack (MC-69865).
+        let pos = self
+            .remote
+            .as_mut()
+            .and_then(|r| stop_destroy(&mut r.destroying, &mut r.is_destroying));
+        let Some(pos) = pos else {
+            return;
+        };
+        let state = self.world.block(pos[0], pos[1], pos[2]);
+        self.tutorial_destroy(state, -1.0);
+        self.send(S::PlayerAction(play::PlayerAction {
+            action: 2,
+            pos,
+            direction: 0,
+            sequence: 0,
+        }));
+        self.reset_attack_strength();
+        // level.destroyBlockProgress(-1): the crack clears for this player.
+        self.mining = None;
     }
 
     /// MultiPlayerGameMode.startDestroyBlock / continueDestroyBlock.
@@ -4967,6 +5033,11 @@ impl Game<'_> {
             .can_destroy_block(self.held(), self.creative)
         {
             self.stop_remote_mining();
+            // Vanilla has no such guard (startDestroyBlock runs for any
+            // item); this drop keeps the old full stop, target included.
+            if let Some(r) = self.remote.as_mut() {
+                r.destroying = None;
+            }
             self.mining = None;
             return;
         }
@@ -5023,90 +5094,104 @@ impl Game<'_> {
         let same = self.remote.as_ref().is_some_and(|r| {
             r.destroying.is_some_and(|(p, _, _)| p == hit.pos) && r.destroying_item == held
         });
-        if start && same {
-            return;
-        }
-        if !same {
-            if let Some((old, _, _)) = self.remote.as_mut().and_then(|r| r.destroying.take()) {
-                let old_state = self.world.block(old[0], old[1], old[2]);
-                self.tutorial_destroy(old_state, -1.0);
-                self.send(S::PlayerAction(play::PlayerAction {
-                    action: 2,
-                    pos: old,
-                    direction: face,
-                    sequence: 0,
-                }));
-            }
-            let seq = self.next_sequence();
-            self.send(S::PlayerAction(play::PlayerAction {
-                action: 0,
-                pos: hit.pos,
-                direction: face,
-                sequence: seq,
-            }));
-            self.tutorial_destroy(state, 0.0);
-            if progress >= 1.0 {
-                // startDestroyBlock: instant survival breaks have no destroy delay.
-                if !debug_stick {
-                    self.predict_break(hit.pos, state, seq);
+        // isDestroying: a dig runs on the target.
+        let is_destroying = self.remote.as_ref().is_some_and(|r| r.is_destroying);
+        match destroy_route(start, same, is_destroying) {
+            DestroyRoute::Running => {}
+            DestroyRoute::Start { abort_old } => {
+                // startDestroyBlock's "Abort old break": only a running dig
+                // is aborted — a stopped one was already aborted by its stop.
+                if abort_old
+                    && let Some((old, _, _)) =
+                        self.remote.as_mut().and_then(|r| r.destroying.take())
+                {
+                    let old_state = self.world.block(old[0], old[1], old[2]);
+                    self.tutorial_destroy(old_state, -1.0);
+                    self.send(S::PlayerAction(play::PlayerAction {
+                        action: 2,
+                        pos: old,
+                        direction: face,
+                        sequence: 0,
+                    }));
                 }
-                return;
-            }
-            if let Some(r) = self.remote.as_mut() {
-                r.destroying = Some((hit.pos, face, 0.0));
-                r.destroying_item = held;
-            }
-            // startDestroyBlock plays the first hit and crack itself; the
-            // server's level events 2019 and 2020 do the rest.
-            self.breaking_block_effects(hit.pos, hit.face, true);
-            self.mining = Some(Mining {
-                pos: hit.pos,
-                progress: 0.0,
-                ticks: 0,
-            });
-            return;
-        }
-        let Some((pos, last_face, done)) = self.remote.as_ref().and_then(|r| r.destroying) else {
-            return;
-        };
-        let done = done + progress;
-        self.tutorial_destroy(state, done.clamp(0.0, 1.0));
-        let ticks = self.mining.as_ref().map_or(0, |m| m.ticks) + 1;
-        if done >= 1.0 {
-            let seq = self.next_sequence();
-            // DebugStickItem.canDestroyBlock: the server selects the property
-            // and sends the block update instead; never predict a break.
-            if !debug_stick {
-                self.predict_break(pos, state, seq);
-            }
-            self.send(S::PlayerAction(play::PlayerAction {
-                action: 3,
-                pos,
-                direction: face,
-                sequence: seq,
-            }));
-            if let Some(r) = self.remote.as_mut() {
-                r.destroying = None;
-                r.destroy_delay = 5;
-            }
-            self.mining = None;
-        } else {
-            if last_face != face {
+                let seq = self.next_sequence();
                 self.send(S::PlayerAction(play::PlayerAction {
-                    action: 1,
-                    pos,
+                    action: 0,
+                    pos: hit.pos,
                     direction: face,
-                    sequence: 0,
+                    sequence: seq,
                 }));
+                self.tutorial_destroy(state, 0.0);
+                if progress >= 1.0 {
+                    // startDestroyBlock: instant survival breaks have no destroy delay.
+                    if !debug_stick {
+                        self.predict_break(hit.pos, state, seq);
+                    }
+                    return;
+                }
+                if let Some(r) = self.remote.as_mut() {
+                    r.destroying = Some((hit.pos, face, 0.0));
+                    r.destroying_item = held;
+                    r.is_destroying = true;
+                }
+                // startDestroyBlock plays the first hit and crack itself; the
+                // server's level events 2019 and 2020 do the rest.
+                self.breaking_block_effects(hit.pos, hit.face, true);
+                self.mining = Some(Mining {
+                    pos: hit.pos,
+                    progress: 0.0,
+                    ticks: 0,
+                });
             }
-            if let Some(r) = self.remote.as_mut() {
-                r.destroying = Some((pos, face, done));
+            DestroyRoute::Continue => {
+                let Some((pos, last_face, done)) = self.remote.as_ref().and_then(|r| r.destroying)
+                else {
+                    return;
+                };
+                let done = done + progress;
+                self.tutorial_destroy(state, done.clamp(0.0, 1.0));
+                let ticks = self.mining.as_ref().map_or(0, |m| m.ticks) + 1;
+                if done >= 1.0 {
+                    let seq = self.next_sequence();
+                    // DebugStickItem.canDestroyBlock: the server selects the property
+                    // and sends the block update instead; never predict a break.
+                    if !debug_stick {
+                        self.predict_break(pos, state, seq);
+                    }
+                    self.send(S::PlayerAction(play::PlayerAction {
+                        action: 3,
+                        pos,
+                        direction: face,
+                        sequence: seq,
+                    }));
+                    if let Some(r) = self.remote.as_mut() {
+                        // continueDestroyBlock's finish: isDestroying goes
+                        // false (stopDestroyBlock is a no-op until the next
+                        // START); the crack and the delay come with it.
+                        r.destroying = None;
+                        r.is_destroying = false;
+                        r.destroy_delay = 5;
+                    }
+                    self.mining = None;
+                } else {
+                    if last_face != face {
+                        self.send(S::PlayerAction(play::PlayerAction {
+                            action: 1,
+                            pos,
+                            direction: face,
+                            sequence: 0,
+                        }));
+                    }
+                    if let Some(r) = self.remote.as_mut() {
+                        r.destroying = Some((pos, face, done));
+                    }
+                    self.mining = Some(Mining {
+                        pos,
+                        progress: done,
+                        ticks,
+                    });
+                }
             }
-            self.mining = Some(Mining {
-                pos,
-                progress: done,
-                ticks,
-            });
         }
     }
     /// MultiPlayerGameMode.destroyBlock: the predicted break.
@@ -5161,8 +5246,9 @@ impl Game<'_> {
     /// Minecraft.startUseItem: use one crosshair target, then the item itself.
     fn remote_use(&mut self) {
         // Minecraft.startUseItem returns before resetting rightClickDelay
-        // while a survival block break is active.
-        if self.remote.as_ref().is_some_and(|r| r.destroying.is_some()) {
+        // while a survival block break is active (gameMode.isDestroying —
+        // a stopped one, its target kept, does not block the use).
+        if self.remote.as_ref().is_some_and(|r| r.is_destroying) {
             return;
         }
         self.use_delay = 4;
@@ -6205,15 +6291,15 @@ impl Game<'_> {
                 self.remote_mining(false);
                 self.swing_arm();
                 self.send(S::Punch(Empty));
-            } else {
-                if let Some(r) = self.remote.as_mut() {
-                    r.destroying = None;
-                }
-                self.mining = None;
             }
+            // Minecraft.continueAttack: a block whose state turned to air
+            // (a prediction or an update since the pick) neither continues
+            // nor stops the dig — the break state stays (MC-69865).
         } else {
+            // stopDestroyBlock, whose acting gates the crack's clearing: the
+            // falls between the jumps at a too-high block keep the break
+            // state standing for the held attack (MC-69865).
             self.stop_remote_mining();
-            self.mining = None;
         }
     }
     /// Keys with a multiplayer meaning; returns true when consumed.
@@ -7859,5 +7945,75 @@ mod tests {
             assert!(super::use_ends_click(shield, gliding));
             assert!(!super::use_ends_click(stick, gliding));
         }
+    }
+
+    /// `MultiPlayerGameMode.stopDestroyBlock` (MC-69865): the first miss of a
+    /// jump at a too-high block aborts the dig and resets its progress, and
+    /// every fall after that stops nothing — the target keeps its progress
+    /// for the held attack to pick back up once the block is in reach again.
+    #[test]
+    fn a_stop_without_a_running_dig_keeps_the_break_state() {
+        let (mut destroying, mut active) = (Some(([1, 60, 2], 0, 0.4)), true);
+        // The jump's apex dug; the fall misses: the dig is aborted once, its
+        // progress reset, the target kept for the server's STOP to match.
+        assert_eq!(
+            super::stop_destroy(&mut destroying, &mut active),
+            Some([1, 60, 2])
+        );
+        assert!(!active);
+        assert_eq!(destroying, Some(([1, 60, 2], 0, 0.0)));
+        // The next apex digs on (0.3 more), and every fall after that is a
+        // no-op: the break state stands, crack and all.
+        destroying.as_mut().unwrap().2 += 0.3;
+        assert_eq!(super::stop_destroy(&mut destroying, &mut active), None);
+        assert_eq!(destroying, Some(([1, 60, 2], 0, 0.3)));
+        assert_eq!(super::stop_destroy(&mut destroying, &mut active), None);
+        assert_eq!(destroying, Some(([1, 60, 2], 0, 0.3)));
+    }
+
+    /// `startDestroyBlock` / `continueDestroyBlock` routing (MC-69865): a held
+    /// attack continues the same target — never a second START, so the server
+    /// keeps counting the dig from the first one — while a click restarts a
+    /// stopped dig, and a new target is started either way.
+    #[test]
+    fn a_held_attack_continues_a_stopped_dig_without_a_new_start() {
+        use super::DestroyRoute;
+        // A click while the dig runs: startDestroyBlock's early return.
+        assert_eq!(
+            super::destroy_route(true, true, true),
+            DestroyRoute::Running
+        );
+        // A held attack on the same target continues it, running or stopped.
+        assert_eq!(
+            super::destroy_route(false, true, true),
+            DestroyRoute::Continue
+        );
+        assert_eq!(
+            super::destroy_route(false, true, false),
+            DestroyRoute::Continue
+        );
+        // A click on a stopped dig restarts it (a fresh START), without an
+        // abort — its stop already aborted it.
+        assert_eq!(
+            super::destroy_route(true, true, false),
+            DestroyRoute::Start { abort_old: false }
+        );
+        // A new target starts a dig, aborting the old one only while one runs.
+        assert_eq!(
+            super::destroy_route(true, false, true),
+            DestroyRoute::Start { abort_old: true }
+        );
+        assert_eq!(
+            super::destroy_route(true, false, false),
+            DestroyRoute::Start { abort_old: false }
+        );
+        assert_eq!(
+            super::destroy_route(false, false, true),
+            DestroyRoute::Start { abort_old: true }
+        );
+        assert_eq!(
+            super::destroy_route(false, false, false),
+            DestroyRoute::Start { abort_old: false }
+        );
     }
 }
